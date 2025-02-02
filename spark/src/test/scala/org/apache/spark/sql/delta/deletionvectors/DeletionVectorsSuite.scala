@@ -36,6 +36,7 @@ import org.apache.hadoop.fs.Path
 import org.apache.parquet.format.converter.ParquetMetadataConverter
 import org.apache.parquet.hadoop.ParquetFileReader
 
+import org.apache.spark.SparkConf
 import org.apache.spark.SparkException
 import org.apache.spark.sql.{DataFrame, QueryTest, Row}
 import org.apache.spark.sql.catalyst.TableIdentifier
@@ -53,6 +54,11 @@ class DeletionVectorsSuite extends QueryTest
   with DeltaExceptionTestUtils
   with DeltaExcludedBySparkVersionTestMixinShims {
   import testImplicits._
+
+  override protected def sparkConf: SparkConf = {
+    super.sparkConf
+      .set(DeltaSQLConf.TEST_DV_NAME_PREFIX.key, "test%dv%prefix-")
+  }
 
   override def beforeAll(): Unit = {
     super.beforeAll()
