@@ -582,7 +582,7 @@ class DeltaLog private(
     }
 
     val fileIndex = TahoeLogFileIndex(
-      spark, this, dataPath, snapshotToUse, partitionFilters, isTimeTravelQuery)
+      spark, this, dataPath, snapshotToUse, catalogTableOpt, partitionFilters, isTimeTravelQuery)
     var bucketSpec: Option[BucketSpec] = None
 
     val r = buildHadoopFsRelationWithFileIndex(snapshotToUse, fileIndex, bucketSpec = bucketSpec)
@@ -941,7 +941,9 @@ object DeltaLog extends DeltaLogging {
           )
         }
     }
-    def getDeltaLogFromCache(): DeltaLog = {
+    val cacheKey = path -> fileSystemOptions
+
+    def getDeltaLogFromCache: DeltaLog = {
       // The following cases will still create a new ActionLog even if there is a cached
       // ActionLog using a different format path:
       // - Different `scheme`
@@ -949,7 +951,7 @@ object DeltaLog extends DeltaLogging {
       // - Different mount point.
       try {
         getOrCreateCache(spark.sessionState.conf)
-          .get(path -> fileSystemOptions, () => {
+          .get(cacheKey, () => {
             createDeltaLog()
           }
         )
@@ -959,12 +961,12 @@ object DeltaLog extends DeltaLogging {
       }
     }
 
-    val deltaLog = getDeltaLogFromCache()
+    val deltaLog = getDeltaLogFromCache
     if (Option(deltaLog.sparkContext.get).map(_.isStopped).getOrElse(true)) {
       // Invalid the cached `DeltaLog` and create a new one because the `SparkContext` of the cached
       // `DeltaLog` has been stopped.
-      getOrCreateCache(spark.sessionState.conf).invalidate(path -> fileSystemOptions)
-      getDeltaLogFromCache()
+      getOrCreateCache(spark.sessionState.conf).invalidate(cacheKey)
+      getDeltaLogFromCache
     } else {
       deltaLog
     }
