@@ -26,7 +26,8 @@ object DateTimeExpressionShims {
     expr match {
       case _: AddMonthsBase | _: DateAdd | _: DateAddInterval | _: DateDiff | _: DateSub |
            _: DatetimeSub | _: LastDay | _: MonthsBetween | _: NextDay | _: SubtractDates |
-           _: SubtractTimestamps | _: TimeAdd | _: TimestampAdd | _: TimestampAddYMInterval |
+           _: SubtractTimestamps | _: TimestampAddInterval | _: TimestampAdd |
+           _: TimestampAddYMInterval |
            _: TimestampDiff | _: TruncInstant => true
       case _ => false
     }
