@@ -33,6 +33,13 @@ This design enables:
 - Metadata changes proportional to operation size
 - Stable leaf manifests that can be cached effectively
 
+Delta statistics and the metadata tree also record bounds differently. Delta truncates the timestamp bounds of `add.stats` to milliseconds, so readers widen a timestamp `maxValues` before using it, and `tightBounds` can't describe exact timestamp bounds. Manifests store bounds as typed microsecond values. This RFC adds a `tightStats` statistic, whose timestamp bounds keep microsecond precision, so that statistics convert between the two forms without loss. A manifest entry records the file's tightness in an entry-level `tight_bounds` field, since Delta's tightness flags describe the whole file rather than one column.
+
+## Open questions
+
+- **Field IDs for tightness.** The entry-level `tight_bounds` field, the `__delta` struct of `content_stats` and its `legacy_tight_bounds` field (see [Tightness](#tightness)) need field IDs that don't collide with Iceberg's. They are TBD here, pending agreement with the Iceberg V4 spec, which defines `tight_bounds` per column rather than per entry. The prototype implementation uses the provisional IDs 2147483327, 2147483337 and 2147483338.
+- **String bounds.** The entry-level `tight_bounds` doesn't cover string columns, whose bounds Delta truncates to a prefix. An Iceberg reader could read `tight_bounds = true` as exact bounds for every column. This needs to be aligned with Iceberg before Iceberg readers read these manifests (see [Compatibility Notes](#compatibility-notes)).
+
 --------
 
 # Changes to existing sections
@@ -159,6 +166,44 @@ This design enables:
 | <ins>lastManifestCommit</ins> | <ins>Struct</ins> | <ins>The latest manifest commit up to this version. Uses the same schema as `commitInfo.lastManifestCommit` and must match its value at the CRC's version.</ins> | <ins>Required from the first manifest commit onward; absent otherwise.</ins> |
 
 <ins>CRC files remain optional. Readers may obtain `lastManifestCommit` from the CRC at the target snapshot version. If that CRC is unavailable, readers must read `commitInfo` from the original JSON commit file at that version. If that CRC is available, its `lastManifestCommit` must be identical to the counterpart from the `commitInfo` of the corresponding version.</ins>
+
+### Per-file Statistics
+
+> ***Change to [existing section](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics)***
+
+<ins>When the `adaptiveMetadata` table feature is supported, statistics support one more global statistic:</ins>
+
+| Name | Description |
+| - | - |
+| <ins>tightStats</ins> | <ins>Whether per-column statistics are currently **tight** or **wide**, like `tightBounds`. Statistics with `tightStats` don't truncate timestamp bounds (see below).</ins> |
+
+<ins>Writers should record `tightStats` instead of `tightBounds` in the statistics they collect for new data files. Statistics may contain `tightBounds`, `tightStats`, both, or neither.</ins>
+
+<ins>**Tight or wide.** Statistics are tight or wide as their `tightBounds` says when it is present, and as their `tightStats` says otherwise. Statistics that contain neither are tight, as before. Writers must not write `tightStats = true` together with `tightBounds = false`.</ins>
+
+<ins>**Timestamp bounds.** In statistics that contain `tightStats`, true or false, the `minValues` and `maxValues` of `timestamp` and `timestampNtz` columns are not truncated to milliseconds, and the footnote of that section on timestamp truncation doesn't apply to them. Writers must write them at microsecond precision, as ISO 8601 strings with six fractional digits: in UTC with a `Z` suffix for `timestamp` (for example `1970-01-01T00:00:00.123456Z`), and with no time zone for `timestampNtz` (for example `1970-01-01T00:00:00.123456`). Readers may use them without the adjustment that truncated bounds need. If `tightStats` is true, they are the smallest and largest valid values of the column. If `tightStats` is false, they are only a lower and an upper bound of its valid values, even when `tightBounds` is true. String bounds may still be truncated, as for all statistics.</ins>
+
+<ins>**Rewriting statistics.** A writer that changes the tightness of existing statistics, for example to mark them wide when it adds a deletion vector to the file, must set every tightness flag the statistics contain to false, and must add `tightBounds = false` if they contain neither. It must not add `tightStats` to statistics that don't contain it, because their timestamp bounds may be truncated. The only exception is the conversion of [Stats Reconciliation](#stats-reconciliation), which widens those bounds first.</ins>
+
+<ins>`tightStats` is defined only for tables that support `adaptiveMetadata`. Readers of other tables ignore it, and would read wide statistics without `tightBounds` as tight. When writers copy statistics that contain `tightStats` but not `tightBounds` to a table that doesn't support the feature, including when the feature is removed (see [Feature Removal](#feature-removal)), they must add `tightBounds` with the value of `tightStats`.</ins>
+
+<ins>For example, the statistics of a new data file with a `timestamp` column and a `timestampNtz` column, whose physical names are `ts` and `ntz`:</ins>
+
+```json
+{
+  "numRecords": 2,
+  "minValues": {"ts": "2026-01-02T03:04:05.123456Z", "ntz": "2026-01-02T03:04:05.123456"},
+  "maxValues": {"ts": "2026-01-02T03:04:05.987654Z", "ntz": "2026-01-02T03:04:05.987654"},
+  "nullCount": {"ts": 0, "ntz": 0},
+  "tightStats": true
+}
+```
+
+<ins>As the `stats` field of an `add` action:</ins>
+
+```json
+"stats": "{\"numRecords\":2,\"minValues\":{\"ts\":\"2026-01-02T03:04:05.123456Z\",\"ntz\":\"2026-01-02T03:04:05.123456\"},\"maxValues\":{\"ts\":\"2026-01-02T03:04:05.987654Z\",\"ntz\":\"2026-01-02T03:04:05.987654\"},\"nullCount\":{\"ts\":0,\"ntz\":0},\"tightStats\":true}"
+```
 
 --------
 
@@ -340,6 +385,7 @@ The root manifest contains entries of the following types:
 | 104 | `file_size_in_bytes` | Long | Required | All | Total file size in bytes |
 | 141 | `spec_id` | Int | Optional | All | Partition spec ID used for this entry |
 | 146 | `content_stats` | Struct ([Content Stats](#content-stats)) | Optional | All | Per-column statistics |
+| TBD | `tight_bounds` | Boolean | Optional | All | Whether the entry's `content_stats` are tight. See [Tightness](#tightness). |
 | 140 | `sort_order_id` | Int | Optional | DATA | Sort order ID for this file |
 | 148 | `deletion_vector` | Struct ([Deletion Vector](#deletion-vector)) | Optional | DATA | Deletion vector for the data file |
 | 150 | `manifest_info` | Struct ([Manifest Info](#manifest-info)) | Optional | DATA_MANIFEST | Manifest-level summary and MDV |
@@ -435,7 +481,7 @@ MDVs track which entries in a leaf manifest have been deleted or replaced. The `
 
 A position cannot be set in both `deleted_positions` and `replaced_positions` simultaneously.
 
-When a `DATA_MANIFEST` entry has a non-null MDV, its `content_stats` are stale: aggregate bounds and counts still include values from invalidated entries. Writers must set `tight_bounds = false` on the manifest-level stats when an MDV is present. After compaction clears the MDV, stats are recomputed from live entries only and `tight_bounds` can be true again.
+When a `DATA_MANIFEST` entry has a non-null MDV, its `content_stats` are stale: aggregate bounds and counts still include values from invalidated entries. Writers must set the `tight_bounds` of a `DATA_MANIFEST` entry to false when an MDV is present. After compaction clears the MDV, stats are recomputed from live entries only and `tight_bounds` can be true again.
 
 ### Content Stats
 
@@ -458,13 +504,14 @@ Each per-column stats struct contains:
 |--------|------------|------------|--------------|-------------|
 | +1 | `lower_bound` | (typed) | all primitives | Lower bound, type matches the table column type |
 | +2 | `upper_bound` | (typed) | all primitives | Upper bound, type matches the table column type |
-| +3 | `tight_bounds` | Boolean | all primitives | When true, bounds are exact min/max |
 | +4 | `value_count` | Long | all | Number of values (including nulls and NaN) |
 | +5 | `null_value_count` | Long | optional fields | Number of null values |
 | +6 | `nan_value_count` | Long | float, double | Number of NaN values |
 | +7 | `avg_value_size_in_bytes` | Int | string, binary | Avg uncompressed value size in bytes |
 
 Implementations are not required to write a stats struct for every table field. If any field is missing from the struct, readers must assume it is unknown.
+
+Writers don't write the per-column `tight_bounds` that Iceberg V4 defines at offset +3, and readers must ignore it. Delta's tightness flags describe the whole file, so the entry records them in file-level fields (see [Tightness](#tightness)).
 
 **Aggregation rules** (for manifest-level stats in root manifest `DATA_MANIFEST` entries, computed over constituent leaf entries):
 
@@ -473,12 +520,24 @@ If any child entry is missing a stats field, the aggregate for that field must b
 - `value_count`, `null_value_count`, `nan_value_count`: sum
 - `lower_bound`: min of non-null child values
 - `upper_bound`: max of non-null child values
-- `tight_bounds`: AND (false if any constituent is false)
+- entry-level `tight_bounds`: AND (false if any constituent is false)
 - `avg_value_size_in_bytes`: must be null at the manifest level
+- `__delta`: must be null at the manifest level
+
+#### Tightness
+
+An entry records the tightness of its statistics (see [Per-file Statistics](#per-file-statistics)) in two fields:
+
+| Field ID | Field Name | Delta Type | Required | Applicable To | Description |
+|----------|------------|------------|----------|---------------|-------------|
+| TBD | `tight_bounds` | Boolean | Optional | All | Entry-level field, next to `content_stats`. For a `DATA` entry, the `tightStats` of the file's statistics; for a `DATA_MANIFEST` entry, the aggregate over the leaf manifest (see the aggregation rules above). Null when unknown. |
+| TBD | `legacy_tight_bounds` | Boolean | Optional | DATA | Field of the `__delta` struct (field ID TBD), the last field of `content_stats`. The `tightBounds` of the file's statistics; null when they don't contain it. |
+
+`tight_bounds = true` means that `lower_bound` and `upper_bound` are the smallest and largest valid values of each column, accounting for the entry's deletion vector, except that string bounds may be truncated, and that `null_value_count` counts the nulls among valid rows. Otherwise the bounds are only lower and upper bounds of the valid values. The `__delta` struct holds Delta-specific fields that have no Iceberg counterpart; readers that don't know it ignore it.
 
 ### Stats Reconciliation
 
-Delta `add` actions carry statistics as a JSON `stats` string (`numRecords`, `nullCount`, `minValues`, `maxValues`, `tightBounds`), keyed by physical column name. Manifest entries carry the same information as `content_stats`, keyed by column-mapping field ID and stored in each field's type. A live file's stats exist as `add.stats` while it is only in the Delta log, and as `content_stats` once it is folded into the tree — never both. Readers must treat the two representations as equivalent for data skipping. `remove` actions carry a copy of the removed file's stats so that log replay can prune them (see [Remove File](#remove-file)).
+Delta `add` actions carry statistics as a JSON `stats` string (`numRecords`, `nullCount`, `minValues`, `maxValues`, `tightBounds`, `tightStats`), keyed by physical column name. Manifest entries carry the same information as `content_stats`, keyed by column-mapping field ID and stored in each field's type. A live file's stats exist as `add.stats` while it is only in the Delta log, and as `content_stats` once it is folded into the tree — never both. Readers must treat the two representations as equivalent for data skipping. `remove` actions carry a copy of the removed file's stats so that log replay can prune them (see [Remove File](#remove-file)).
 
 When folding a log `add` into a manifest, writers convert `add.stats` to `content_stats` as follows. Field IDs are the schema's column mapping IDs (`delta.columnMapping.id`), which are assigned in both `name` and `id` mode: the stats key (a physical column name) is matched to the schema field with that `delta.columnMapping.physicalName`, and that field's ID keys the stats struct. `minValues`/`maxValues` are converted from their JSON representation to the field's typed value.
 
@@ -488,9 +547,29 @@ When folding a log `add` into a manifest, writers convert `add.stats` to `conten
 | `nullCount[col]` | `null_value_count` |
 | `minValues[col]` | `lower_bound` |
 | `maxValues[col]` | `upper_bound` |
-| `tightBounds` | `tight_bounds` |
+| `tightBounds` | `__delta.legacy_tight_bounds` |
+| `tightStats` | entry `tight_bounds` |
 
-`value_count` and `nan_value_count` have no Delta source and are left unpopulated (readers treat them as unknown). `tightBounds` carries Delta's wide-bounds-under-deletion-vectors semantics to `tight_bounds`, consistent with manifest-level stats being `tight_bounds = false` when an MDV is present.
+`value_count` and `nan_value_count` have no Delta source and are left unpopulated (readers treat them as unknown).
+
+Statistics that contain `tightStats` convert as the table shows. Statistics that don't contain it may truncate timestamp bounds to milliseconds, which `content_stats` can't represent, so writers convert them as follows:
+- The `upper_bound` of a `timestamp` or `timestampNtz` column is its `maxValues` plus one millisecond, or the largest value of the type if that would overflow. Its `lower_bound` is its `minValues`, which truncation already made a lower bound.
+- The entry's `tight_bounds` is false if any column has timestamp bounds, because a widened bound is not exact. Otherwise it is true if `tightBounds` is true or absent, and false otherwise. Writers may always write false.
+- `legacy_tight_bounds` is `tightBounds`, as for other statistics.
+
+When converting an entry back to `add.stats`, for example for a `remove` of the file, writers set `tightStats` to the entry's `tight_bounds` and `tightBounds` to its `legacy_tight_bounds`, omitting either one when it is null, and write timestamp bounds at microsecond precision. If `tight_bounds` is null, the statistics don't contain `tightStats`, and `tightBounds` is `legacy_tight_bounds`, or false if that is null too. Readers then treat their timestamp bounds as truncated, which is conservative.
+
+A file whose statistics don't contain `tightStats` thus gains it on its first conversion, with `tightStats = false` if it has timestamp bounds. Its bounds don't change on later conversions, so they are never widened twice. For example, these statistics without `tightStats`:
+
+```json
+{"numRecords": 2, "minValues": {"ts": "2026-01-02T03:04:05.123Z"}, "maxValues": {"ts": "2026-01-02T03:04:05.987Z"}, "nullCount": {"ts": 0}, "tightBounds": true}
+```
+
+convert to an entry with `upper_bound` `2026-01-02T03:04:05.988000` UTC for `ts`, `tight_bounds = false` and `legacy_tight_bounds = true`, which converts back to:
+
+```json
+{"numRecords": 2, "minValues": {"ts": "2026-01-02T03:04:05.123000Z"}, "maxValues": {"ts": "2026-01-02T03:04:05.988000Z"}, "nullCount": {"ts": 0}, "tightBounds": true, "tightStats": false}
+```
 
 ## Snapshot ID Generation
 
@@ -602,6 +681,7 @@ When `adaptiveMetadata` is supported and active, readers must:
 - Read the root manifest at `contentRoot.path` and skip leaf-manifest entries marked in `manifest_info.dv` (see [Manifest Deletion Vectors](#manifest-deletion-vectors-mdvs)).
 - Reconstruct the current table state by applying the commits after `checkpointMetadata.version` on top of the tree, following [Action Reconciliation](#action-reconciliation).
 - Read any `sidecar` entries referenced by the checkpoint to obtain the complete set of transaction identifiers and domain metadata (see [Checkpoint Action](#checkpoint-action)).
+- Determine whether file statistics are tight from `tightBounds`, or from `tightStats` when `tightBounds` is absent (see [Per-file Statistics](#per-file-statistics)).
 
 ## Writer Requirements for Adaptive Metadata
 
@@ -615,6 +695,7 @@ When `adaptiveMetadata` is supported and active, writers must:
 - Write timestamp values in manifests as `int64` `TIMESTAMP(MICROS)`, not `int96`, with `isAdjustedToUTC = true` for `timestamp` and `false` for `timestampNtz`. This covers the `partition` tuple (field 102) and the `lower_bound` / `upper_bound` of [Content Stats](#content-stats) (field 146).
 - Resolve conflicts with commits that land concurrently, per [Conflict Resolution](#conflict-resolution).
 - Include the `dataChange` field in the `commitInfo` action of every commit (see [Commit Provenance Information](#commit-provenance-information)).
+- Write the timestamp bounds of statistics that contain `tightStats` at microsecond precision, and add `tightStats` to statistics that don't contain it only by the conversion of [Stats Reconciliation](#stats-reconciliation) (see [Per-file Statistics](#per-file-statistics)).
 
 ### Manifest Commit Procedure
 
@@ -751,6 +832,8 @@ When `adaptiveMetadata` is added to `readerFeatures` and `writerFeatures`, the r
 ## Feature Removal
 
 When `adaptiveMetadata` is removed from the protocol, a traditional checkpoint must be produced from the current metadata tree state so that the table can be read without adaptiveMetadata support. Manifest files that are no longer referenced may be cleaned up.
+
+In that checkpoint, statistics that contain `tightStats` but not `tightBounds` must also contain `tightBounds`, with the value of `tightStats`. Readers without `adaptiveMetadata` support ignore `tightStats`, and would otherwise read wide statistics as tight (see [Per-file Statistics](#per-file-statistics)).
 
 ## Compatibility Notes
 
